@@ -21,23 +21,29 @@
 use capsules_core::process_console::{self, ProcessConsole};
 use capsules_core::virtualizers::virtual_alarm::{MuxAlarm, VirtualMuxAlarm};
 use capsules_core::virtualizers::virtual_uart::{MuxUart, UartDevice};
+use capsules_extra::net::ieee802154::Header;
 use core::mem::MaybeUninit;
 use kernel::capabilities;
 use kernel::component::Component;
 use kernel::hil;
 use kernel::hil::time::Alarm;
 use kernel::process::ProcessPrinter;
+use kernel::utilities::packet_buffer::{PacketBufferMut, PacketSliceMut};
 
 #[macro_export]
 macro_rules! process_console_component_static {
     ($A: ty, $COMMAND_HISTORY_LEN: expr $(,)?) => {{
         let alarm = kernel::static_buf!(capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<'static, $A>);
-        let uart = kernel::static_buf!(capsules_core::virtualizers::virtual_uart::UartDevice);
+        let uart = kernel::static_buf!(capsules_core::virtualizers::virtual_uart::UartDevice<1,1,0,0>);
         let pconsole = kernel::static_buf!(
             capsules_core::process_console::ProcessConsole<
                 $COMMAND_HISTORY_LEN,
                 capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<'static, $A>,
                 components::process_console::Capability,
+                2,
+                1,
+                1,
+                1
             >
         );
 
@@ -67,7 +73,7 @@ macro_rules! process_console_component_static {
 
 pub struct ProcessConsoleComponent<const COMMAND_HISTORY_LEN: usize, A: 'static + Alarm<'static>> {
     board_kernel: &'static kernel::Kernel,
-    uart_mux: &'static MuxUart<'static>,
+    uart_mux: &'static MuxUart<'static, 0, 0, 1, 1>,
     alarm_mux: &'static MuxAlarm<'static, A>,
     process_printer: &'static dyn ProcessPrinter,
     reset_function: Option<fn() -> !>,
@@ -78,7 +84,7 @@ impl<const COMMAND_HISTORY_LEN: usize, A: 'static + Alarm<'static>>
 {
     pub fn new(
         board_kernel: &'static kernel::Kernel,
-        uart_mux: &'static MuxUart,
+        uart_mux: &'static MuxUart<0, 0, 1, 1>,
         alarm_mux: &'static MuxAlarm<'static, A>,
         process_printer: &'static dyn ProcessPrinter,
         reset_function: Option<fn() -> !>,
@@ -115,14 +121,23 @@ impl<const COMMAND_HISTORY_LEN: usize, A: 'static + Alarm<'static>> Component
 {
     type StaticInput = (
         &'static mut MaybeUninit<VirtualMuxAlarm<'static, A>>,
-        &'static mut MaybeUninit<UartDevice<'static>>,
+        &'static mut MaybeUninit<UartDevice<'static, 1, 1, 0, 0>>,
         &'static mut MaybeUninit<[u8; capsules_core::process_console::WRITE_BUF_LEN]>,
         &'static mut MaybeUninit<[u8; capsules_core::process_console::READ_BUF_LEN]>,
         &'static mut MaybeUninit<[u8; capsules_core::process_console::QUEUE_BUF_LEN]>,
         &'static mut MaybeUninit<[u8; capsules_core::process_console::COMMAND_BUF_LEN]>,
         &'static mut MaybeUninit<[capsules_core::process_console::Command; COMMAND_HISTORY_LEN]>,
         &'static mut MaybeUninit<
-            ProcessConsole<'static, COMMAND_HISTORY_LEN, VirtualMuxAlarm<'static, A>, Capability>,
+            ProcessConsole<
+                'static,
+                COMMAND_HISTORY_LEN,
+                VirtualMuxAlarm<'static, A>,
+                Capability,
+                2,
+                1,
+                1,
+                1,
+            >,
         >,
     );
     type Output = &'static process_console::ProcessConsole<
@@ -130,11 +145,17 @@ impl<const COMMAND_HISTORY_LEN: usize, A: 'static + Alarm<'static>> Component
         COMMAND_HISTORY_LEN,
         VirtualMuxAlarm<'static, A>,
         Capability,
+        2,
+        1,
+        1,
+        1,
     >;
 
     fn finalize(self, static_buffer: Self::StaticInput) -> Self::Output {
         // Create virtual device for console.
-        let console_uart = static_buffer.1.write(UartDevice::new(self.uart_mux, true));
+        let console_uart = static_buffer
+            .1
+            .write(UartDevice::new(self.uart_mux, true, false));
         console_uart.setup();
 
         // Get addresses of where the kernel is placed to enable additional
@@ -174,11 +195,14 @@ impl<const COMMAND_HISTORY_LEN: usize, A: 'static + Alarm<'static>> Component
             .6
             .write([capsules_core::process_console::Command::default(); COMMAND_HISTORY_LEN]);
 
+        let ps = PacketSliceMut::new(write_buffer, 5).unwrap();
+        // ps.set_headroom(10);
+
         let console = static_buffer.7.write(ProcessConsole::new(
             console_uart,
             console_alarm,
             self.process_printer,
-            write_buffer,
+            PacketBufferMut::new(ps).unwrap(),
             read_buffer,
             queue_buffer,
             command_buffer,

@@ -6,6 +6,7 @@
 //!
 //!
 
+use crate::utilities::packet_buffer::PacketBufferMut;
 use crate::ErrorCode;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -65,16 +66,48 @@ pub enum Error {
     Aborted,
 }
 
-pub trait Uart<'a>: Configure + Transmit<'a> + Receive<'a> {}
-pub trait UartData<'a>: Transmit<'a> + Receive<'a> {}
-pub trait UartAdvanced<'a>: Configure + Transmit<'a> + ReceiveAdvanced<'a> {}
-pub trait Client: ReceiveClient + TransmitClient {}
+pub trait Uart<'a, const HEAD: usize, const TAIL: usize>:
+    Configure + Transmit<'a, HEAD, TAIL> + Receive<'a>
+{
+}
+pub trait UartData<'a, const HEAD: usize, const TAIL: usize>:
+    Transmit<'a, HEAD, TAIL> + Receive<'a>
+{
+}
+pub trait UartAdvanced<'a, const HEAD: usize, const TAIL: usize>:
+    Configure + Transmit<'a, HEAD, TAIL> + ReceiveAdvanced<'a>
+{
+}
+pub trait Client<const HEAD: usize, const TAIL: usize>:
+    ReceiveClient + TransmitClient<HEAD, TAIL>
+{
+}
 
 // Provide blanket implementations for all trait groups
-impl<'a, T: Configure + Transmit<'a> + Receive<'a>> Uart<'a> for T {}
-impl<'a, T: Transmit<'a> + Receive<'a>> UartData<'a> for T {}
-impl<'a, T: Configure + Transmit<'a> + ReceiveAdvanced<'a>> UartAdvanced<'a> for T {}
-impl<T: ReceiveClient + TransmitClient> Client for T {}
+impl<
+        'a,
+        T: Configure + Transmit<'a, HEAD, TAIL> + Receive<'a>,
+        const HEAD: usize,
+        const TAIL: usize,
+    > Uart<'a, HEAD, TAIL> for T
+{
+}
+impl<'a, const HEAD: usize, const TAIL: usize, T: Transmit<'a, HEAD, TAIL> + Receive<'a>>
+    UartData<'a, HEAD, TAIL> for T
+{
+}
+impl<
+        'a,
+        const HEAD: usize,
+        const TAIL: usize,
+        T: Configure + Transmit<'a, HEAD, TAIL> + ReceiveAdvanced<'a>,
+    > UartAdvanced<'a, HEAD, TAIL> for T
+{
+}
+impl<const HEAD: usize, const TAIL: usize, T: ReceiveClient + TransmitClient<HEAD, TAIL>>
+    Client<HEAD, TAIL> for T
+{
+}
 
 /// Trait for configuring a UART.
 pub trait Configure {
@@ -87,10 +120,10 @@ pub trait Configure {
     fn configure(&self, params: Parameters) -> Result<(), ErrorCode>;
 }
 
-pub trait Transmit<'a> {
+pub trait Transmit<'a, const HEAD: usize, const TAIL: usize> {
     /// Set the transmit client, which will be called when transmissions
     /// complete.
-    fn set_transmit_client(&self, client: &'a dyn TransmitClient);
+    fn set_transmit_client(&self, client: &'a dyn TransmitClient<HEAD, TAIL>);
 
     /// Transmit a buffer of data. On completion, `transmitted_buffer`
     /// in the `TransmitClient` will be called.  If the `Result<(), ErrorCode>`
@@ -117,9 +150,10 @@ pub trait Transmit<'a> {
     /// `transmit_buffer` or `transmit_word` operation will return BUSY.
     fn transmit_buffer(
         &self,
-        tx_buffer: &'static mut [u8],
+        // AMALIA: nu ar trebui sa fie referinta mutable aici????
+        tx_buffer: PacketBufferMut<HEAD, TAIL>,
         tx_len: usize,
-    ) -> Result<(), (ErrorCode, &'static mut [u8])>;
+    ) -> Result<(), (ErrorCode, PacketBufferMut<HEAD, TAIL>)>;
 
     /// Transmit a single word of data asynchronously. The word length is
     /// determined by the UART configuration: it can be 6, 7, 8, or 9 bits long.
@@ -220,7 +254,7 @@ pub trait Receive<'a> {
 
 /// Trait implemented by a UART transmitter to receive callbacks when
 /// operations complete.
-pub trait TransmitClient {
+pub trait TransmitClient<const HEAD: usize, const TAIL: usize> {
     /// A call to `Transmit::transmit_word` completed. The `Result<(), ErrorCode>`
     /// indicates whether the word was successfully transmitted. A call
     /// to `transmit_word` or `transmit_buffer` made within this callback
@@ -253,7 +287,7 @@ pub trait TransmitClient {
     ///   - FAIL if the transmission failed in some way.
     fn transmitted_buffer(
         &self,
-        tx_buffer: &'static mut [u8],
+        tx_buffer: PacketBufferMut<HEAD, TAIL>,
         tx_len: usize,
         rval: Result<(), ErrorCode>,
     );

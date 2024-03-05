@@ -12,12 +12,14 @@
 
 use core::cell::Cell;
 use core::cmp::min;
+use cortex_m_semihosting::hprintln;
 use kernel::hil::uart;
-use kernel::utilities::cells::OptionalCell;
+use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::packet_buffer::{PacketBufferDyn, PacketBufferMut, PacketSliceMut};
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, ReadOnly, ReadWrite, WriteOnly};
-use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
+use kernel::utilities::{packet_buffer, StaticRef};
+use kernel::{debug, ErrorCode};
 use nrf5x::pinmux;
 
 const UARTE_MAX_BUFFER_SIZE: u32 = 0xff;
@@ -162,14 +164,15 @@ register_bitfields! [u32,
 /// UARTE
 // It should never be instanced outside this module but because a static mutable reference to it
 // is exported outside this module it must be `pub`
-pub struct Uarte<'a> {
+pub struct Uarte<'a, const HEAD: usize = 0, const TAIL: usize = 0> {
     registers: StaticRef<UarteRegisters>,
-    tx_client: OptionalCell<&'a dyn uart::TransmitClient>,
-    tx_buffer: kernel::utilities::cells::TakeCell<'static, [u8]>,
+    tx_client: OptionalCell<&'a dyn uart::TransmitClient<HEAD, TAIL>>,
+    // AMALIA: ultimu layer va tine un PacketSliceMut, restul vor tine PacketBufferMut
+    tx_buffer: TakeCell<'static, PacketSliceMut>,
     tx_len: Cell<usize>,
     tx_remaining_bytes: Cell<usize>,
     rx_client: OptionalCell<&'a dyn uart::ReceiveClient>,
-    rx_buffer: kernel::utilities::cells::TakeCell<'static, [u8]>,
+    rx_buffer: TakeCell<'static, [u8]>,
     rx_remaining_bytes: Cell<usize>,
     rx_abort_in_progress: Cell<bool>,
     offset: Cell<usize>,
@@ -180,10 +183,10 @@ pub struct UARTParams {
     pub baud_rate: u32,
 }
 
-impl<'a> Uarte<'a> {
+impl<'a, const HEAD: usize, const TAIL: usize> Uarte<'a, HEAD, TAIL> {
     /// Constructor
     // This should only be constructed once
-    pub const fn new(regs: StaticRef<UarteRegisters>) -> Uarte<'a> {
+    pub const fn new(regs: StaticRef<UarteRegisters>) -> Uarte<'a, HEAD, TAIL> {
         Uarte {
             registers: regs,
             tx_client: OptionalCell::empty(),
@@ -305,7 +308,11 @@ impl<'a> Uarte<'a> {
                 // Signal client write done
                 self.tx_client.map(|client| {
                     self.tx_buffer.take().map(|tx_buffer| {
-                        client.transmitted_buffer(tx_buffer, self.tx_len.get(), Ok(()));
+                        client.transmitted_buffer(
+                            PacketBufferMut::new(tx_buffer).unwrap(),
+                            self.tx_len.get(),
+                            Ok(()),
+                        );
                     });
                 });
             } else {
@@ -408,9 +415,20 @@ impl<'a> Uarte<'a> {
 
     fn set_tx_dma_pointer_to_buffer(&self) {
         self.tx_buffer.map(|tx_buffer| {
-            self.registers
-                .txd_ptr
-                .set(tx_buffer[self.offset.get()..].as_ptr() as u32);
+            // --> v2
+            let headroom = tx_buffer.headroom();
+            let tailroom = tx_buffer.tailroom();
+            let capacity = tx_buffer.capacity();
+            self.registers.txd_ptr.set(
+                tx_buffer.data_slice_mut()[headroom + self.offset.get()..capacity - tailroom]
+                    .as_ptr() as u32,
+            );
+
+            // --> v1
+
+            // self.registers
+            //     .txd_ptr
+            //     .set(tx_buffer.data_slice_mut()[self.offset.get()..].as_ptr() as u32);
         });
     }
 
@@ -423,38 +441,51 @@ impl<'a> Uarte<'a> {
     }
 
     // Helper function used by both transmit_word and transmit_buffer
-    fn setup_buffer_transmit(&self, buf: &'static mut [u8], tx_len: usize) {
-        self.tx_remaining_bytes.set(tx_len);
-        self.tx_len.set(tx_len);
+    fn setup_buffer_transmit(&self, buf: PacketBufferMut<HEAD, TAIL>) {
+        let len = buf.payload().len();
+
+        //     buf.headroom(),
+        //     buf.tailroom(),
+        //     buf.payload()
+        // );
+        // self.tx_remaining_bytes.set(tx_len);
+        self.tx_remaining_bytes.set(len);
+        // self.tx_len.set(tx_len);
+        self.tx_len.set(len);
         self.offset.set(0);
-        self.tx_buffer.replace(buf);
+        self.tx_buffer.replace(buf.downcast().unwrap());
         self.set_tx_dma_pointer_to_buffer();
 
         self.registers
             .txd_maxcnt
-            .write(Counter::COUNTER.val(min(tx_len as u32, UARTE_MAX_BUFFER_SIZE)));
+            .write(Counter::COUNTER.val(min(len as u32, UARTE_MAX_BUFFER_SIZE)));
+
         self.registers.task_starttx.write(Task::ENABLE::SET);
 
         self.enable_tx_interrupts();
     }
 }
 
-impl<'a> uart::Transmit<'a> for Uarte<'a> {
-    fn set_transmit_client(&self, client: &'a dyn uart::TransmitClient) {
+impl<'a, const HEAD: usize, const TAIL: usize> uart::Transmit<'a, HEAD, TAIL>
+    for Uarte<'a, HEAD, TAIL>
+{
+    fn set_transmit_client(&self, client: &'a dyn uart::TransmitClient<HEAD, TAIL>) {
         self.tx_client.set(client);
     }
 
     fn transmit_buffer(
         &self,
-        tx_data: &'static mut [u8],
+        tx_data: PacketBufferMut<HEAD, TAIL>,
+        // AMALIA: nu stiu daca pot sa scot tx_len de aici? care e diferenta intre tx_data.len si tx_len??
+        // _tx_len: usize,
         tx_len: usize,
-    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
-        if tx_len == 0 || tx_len > tx_data.len() {
+    ) -> Result<(), (ErrorCode, PacketBufferMut<HEAD, TAIL>)> {
+        if tx_len == 0 || tx_len > tx_data.capacity() {
             Err((ErrorCode::SIZE, tx_data))
         } else if self.tx_buffer.is_some() {
             Err((ErrorCode::BUSY, tx_data))
         } else {
-            self.setup_buffer_transmit(tx_data, tx_len);
+            self.setup_buffer_transmit(tx_data);
             Ok(())
         }
     }
@@ -468,7 +499,7 @@ impl<'a> uart::Transmit<'a> for Uarte<'a> {
     }
 }
 
-impl<'a> uart::Configure for Uarte<'a> {
+impl<'a, const HEAD: usize, const TAIL: usize> uart::Configure for Uarte<'a, HEAD, TAIL> {
     fn configure(&self, params: uart::Parameters) -> Result<(), ErrorCode> {
         // These could probably be implemented, but are currently ignored, so
         // throw an error.
@@ -488,7 +519,7 @@ impl<'a> uart::Configure for Uarte<'a> {
     }
 }
 
-impl<'a> uart::Receive<'a> for Uarte<'a> {
+impl<'a, const HEAD: usize, const TAIL: usize> uart::Receive<'a> for Uarte<'a, HEAD, TAIL> {
     fn set_receive_client(&self, client: &'a dyn uart::ReceiveClient) {
         self.rx_client.set(client);
     }
