@@ -448,7 +448,7 @@ impl<const HEAD: usize, const TAIL: usize, const L_HEAD: usize, const L_TAIL: us
     ) -> DebugWriter<HEAD, TAIL, L_HEAD, L_TAIL> {
         DebugWriter {
             uart,
-            output_buffer: TakeCell::new(out_buffer),
+            output_buffer: OptionalCell::new(out_buffer),
             internal_buffer: TakeCell::new(internal_buffer),
             count: Cell::new(0), // how many debug! calls
         }

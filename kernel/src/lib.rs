@@ -91,7 +91,7 @@
 
 #![warn(unreachable_pub)]
 #![no_std]
-
+#![feature(trait_upcasting)]
 /// Kernel major version.
 ///
 /// This is compiled with the crate to enable for checking of compatibility with
